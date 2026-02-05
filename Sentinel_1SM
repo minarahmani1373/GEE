@@ -1,0 +1,258 @@
+/***************************************
+ * 1. Region (map over whole area)
+ ***************************************/
+var regionFC = ee.FeatureCollection('projects/sentinell1/assets/Montemarano33N');
+var regionGeom = regionFC.geometry();
+
+Map.centerObject(regionFC, 10);
+Map.addLayer(regionGeom, {color: 'red'}, 'Montemarano33N');
+
+/***************************************
+ * 2. Sites (time series ONLY here)
+ ***************************************/
+var sites = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([15.0247981, 40.9339868]), {id: 'Site 1'}),
+  ee.Feature(ee.Geometry.Point([15.0240218, 40.9331319]), {id: 'Site 2'}),
+  ee.Feature(ee.Geometry.Point([15.0241760, 40.9337097]), {id: 'Site 3'}),
+  ee.Feature(ee.Geometry.Point([15.0237220, 40.9327001]), {id: 'Site 4'}),
+  ee.Feature(ee.Geometry.Point([15.0238723, 40.9336824]), {id: 'Site 5'}),
+  ee.Feature(ee.Geometry.Point([15.0232055, 40.9320048]), {id: 'Site 6'})
+]);
+
+Map.addLayer(sites, {color: 'blue'}, 'Sites');
+
+/***************************************
+ * 3. Time definition
+ ***************************************/
+var time_start = ee.Date('2025-01-01');
+var time_end   = ee.Date('2025-12-31');
+var time_dif   = time_end.difference(time_start, 'day');
+
+/***************************************
+ * 4. Sentinel-1 filtering
+ ***************************************/
+var sen1 = imageCollection
+  .filterDate(time_start, time_end)
+  .filterBounds(regionGeom)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VV');
+
+var asc = sen1.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));
+var des = sen1.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+
+/***************************************
+ * 5. 10-day composites
+ ***************************************/
+var list_date = ee.List.sequence(0, time_dif, 10).map(function(interval) {
+  return time_start.advance(interval, 'day');
+});
+
+var asc_10days = ee.ImageCollection(list_date.map(function(d) {
+  var start = ee.Date(d);
+  var end   = start.advance(10, 'day');
+  var img   = asc.filterDate(start, end).mean();
+  var bands = img.bandNames().size();
+  return img
+    .set('system:time_start', start.millis())
+    .set('band_number', bands);
+})).filter(ee.Filter.eq('band_number', 1));
+
+var des_10days = ee.ImageCollection(list_date.map(function(d) {
+  var start = ee.Date(d);
+  var end   = start.advance(10, 'day');
+  var img   = des.filterDate(start, end).mean();
+  var bands = img.bandNames().size();
+  return img
+    .set('system:time_start', start.millis())
+    .set('band_number', bands);
+})).filter(ee.Filter.eq('band_number', 1));
+
+/***************************************
+ * 6. Sigma0 + speckle filtering
+ ***************************************/
+var asc_sigma = asc_10days.map(function(img) {
+  var sigma = ee.Image(10).pow(img.divide(10));
+  var speckle = sigma.focalMean(30, 'square', 'meters');
+  return speckle.copyProperties(img, img.propertyNames());
+});
+
+var des_sigma = des_10days.map(function(img) {
+  var sigma = ee.Image(10).pow(img.divide(10));
+  var speckle = sigma.focalMean(30, 'square', 'meters');
+  return speckle.copyProperties(img, img.propertyNames());
+});
+
+/***************************************
+ * 7. Masks
+ ***************************************/
+var water_mask = imageCollection2.select('label')
+  .filterDate(time_start, time_end)
+  .filterBounds(regionGeom)
+  .mode().eq(0).not();
+
+var urban_mask = imageCollection2.select('label')
+  .filterDate(time_start, time_end)
+  .filterBounds(regionGeom)
+  .mode().eq(6).not();
+
+/***************************************
+ * 8. Soil Moisture index
+ ***************************************/
+var asc_min = asc_sigma.min();
+var asc_max = asc_sigma.max();
+
+var asc_sm = asc_sigma.map(function(img) {
+  var sm = img.subtract(asc_min)
+              .divide(asc_max.subtract(asc_min))
+              .multiply(water_mask)
+              .multiply(urban_mask)
+              .rename('SM_ASC');
+  return sm.copyProperties(img, ['system:time_start']);
+});
+
+var des_min = des_sigma.min();
+var des_max = des_sigma.max();
+
+var des_sm = des_sigma.map(function(img) {
+  var sm = img.subtract(des_min)
+              .divide(des_max.subtract(des_min))
+              .multiply(water_mask)
+              .multiply(urban_mask)
+              .rename('SM_DES');
+  return sm.copyProperties(img, ['system:time_start']);
+});
+/***************************************/
+
+var SM_MIN = 0.0;
+var SM_MAX = 0.6;
+
+// Ascending absolute SM
+var asc_sm_abs = asc_sm.map(function(img) {
+  var sm_abs = img
+    .multiply(SM_MAX - SM_MIN)
+    .add(SM_MIN)
+    .rename('SM_ASC');
+  return sm_abs.copyProperties(img, ['system:time_start']);
+});
+
+// Descending absolute SM
+var des_sm_abs = des_sm.map(function(img) {
+  var sm_abs = img
+    .multiply(SM_MAX - SM_MIN)
+    .add(SM_MIN)
+    .rename('SM_DES');
+  return sm_abs.copyProperties(img, ['system:time_start']);
+});
+
+
+
+/***************************************
+ * 9. Map display (WHOLE REGION)
+ ***************************************/
+
+var smVisAbs = {
+  min: 0.0,
+  max: 0.6,
+  palette: [
+    '#5e3c00',
+    '#b35806',
+    '#f1a340',
+    '#fee08b',
+    '#d9ef8b',
+    '#66bd63',
+    '#1a9850'
+  ]
+};
+
+Map.addLayer(
+  asc_sm_abs.mean().clip(regionGeom),
+  smVisAbs,
+  'Mean SM ASC (absolute)'
+);
+
+Map.addLayer(
+  des_sm_abs.mean().clip(regionGeom),
+  smVisAbs,
+  'Mean SM DES (absolute)'
+);
+
+
+/***************************************
+ * 10. Time series (ONLY AT SITES)
+ ***************************************/
+
+print(
+  ui.Chart.image.seriesByRegion({
+    imageCollection: asc_sm_abs,
+    regions: sites,
+    reducer: ee.Reducer.mean(),
+    band: 'SM_ASC',
+    scale: 30,
+    seriesProperty: 'id',
+    xProperty: 'system:time_start'
+  })
+  .setOptions({
+    title: 'Ascending Soil Moisture (m³/m³)',
+    vAxis: { title: 'Soil Moisture (m³/m³)' }
+  })
+);
+
+print(
+  ui.Chart.image.seriesByRegion({
+    imageCollection: des_sm_abs,
+    regions: sites,
+    reducer: ee.Reducer.mean(),
+    band: 'SM_DES',
+    scale: 30,
+    seriesProperty: 'id',
+    xProperty: 'system:time_start'
+  })
+  .setOptions({
+    title: 'Descending Soil Moisture (m³/m³)',
+    vAxis: { title: 'Soil Moisture (m³/m³)' }
+  })
+);
+
+
+/***************************************
+ * Export ASC and DES SM for each site
+ * One CSV per site
+ ***************************************/
+
+
+// 1️⃣ Define your site manually
+var mySite = ee.Feature(ee.Geometry.Point([15.0247981, 40.9339868]), {id: 'MySite'}); 
+// <-- Change the coordinates here for the site you want
+
+// 2️⃣ Name of the CSV files
+var ascFileName = '1_ASC';  // change this manually
+var desFileName = '1_DES';  // change this manually
+
+
+// 4️⃣ Function to export time series for a single site
+var exportSiteSM = function(siteFeature, imgCol, fileName){
+  var smTimeSeries = imgCol.map(function(img){
+    var meanVal = img.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: siteFeature.geometry(),
+      scale: 30
+    }).get(img.bandNames().get(0)); // get the first band value
+    
+    return ee.Feature(null, {
+      date: img.date().format('YYYY-MM-dd'),
+      SM: meanVal
+    });
+  });
+  
+  // Export the CSV
+  Export.table.toDrive({
+    collection: smTimeSeries,
+    description: fileName,
+    fileNamePrefix: fileName,
+    fileFormat: 'CSV'
+  });
+};
+
+exportSiteSM(mySite, asc_sm_abs, ascFileName);
+exportSiteSM(mySite, des_sm_abs, desFileName);
